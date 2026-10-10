@@ -1,7 +1,10 @@
-transformers>=4.43
-accelerate
-torch
+transformers>=4.45.0
+accelerate>=0.26.0
+bitsandbytes
+torchvision
+pillow
 fastapi
 uvicorn
 pyngrok
 nest-asyncio
+pydantic
