@@ -11,7 +11,8 @@ import logging
 import os
 import time
 from typing import Dict, Any, Tuple
-from PIL import Image, ImageStat
+from io import BytesIO
+from PIL import Image, ImageStat, ImageDraw, ImageFont
 import httpx
 
 from text_utils import normalize_persian_text, detect_question_level
@@ -32,8 +33,8 @@ if os.path.exists(_env_file):
         pass
 
 AI_SERVICE_URL = os.getenv("AI_SERVICE_URL", "http://127.0.0.1:8000").rstrip("/")
-AI_TIMEOUT_SECONDS = float(os.getenv("AI_TIMEOUT_SECONDS", "45.0"))
-AI_MODEL_NAME = os.getenv("AI_MODEL_NAME", "Qwen/Qwen2-VL-7B-Instruct")
+AI_TIMEOUT_SECONDS = float(os.getenv("AI_TIMEOUT_SECONDS", "180.0"))
+AI_MODEL_NAME = os.getenv("AI_MODEL_NAME", "Qwen/Qwen3-VL-8B-Instruct")
 
 SYSTEM_PROMPT = """شما یک دستیار هوشمند و تخصصی پرسش و پاسخ تصویری (Visual Question Answering) به زبان فارسی هستید.
 وظیفه شما این است که صرفاً بر اساس محتوا و شواهد قابل مشاهده در تصویر ورودی، به پرسش کاربر پاسخ دهید.
@@ -59,10 +60,11 @@ async def check_ai_health() -> Tuple[bool, str]:
             resp = await client.get(f"{AI_SERVICE_URL}/health")
             if resp.status_code == 200:
                 data = resp.json()
-                return True, data.get("model", AI_MODEL_NAME)
+                if data.get("status") == "ready":
+                    return True, data.get("model", AI_MODEL_NAME)
     except Exception:
         pass
-    return False, "Standalone Local Visual Engine (Ready for Colab)"
+    return False, "Qwen3-VL service unavailable"
 
 
 def local_visual_analysis(image_path: str, question: str, level: int) -> Dict[str, Any]:
@@ -164,7 +166,9 @@ def local_visual_analysis(image_path: str, question: str, level: int) -> Dict[st
 async def query_vqa(
     image_path: str,
     question: str,
-    level: int | None = None
+    level: int | None = None,
+    second_image_path: str | None = None,
+    regions: list[dict] | None = None,
 ) -> Dict[str, Any]:
     """
     Main gateway method:
@@ -176,16 +180,78 @@ async def query_vqa(
     norm_q = normalize_persian_text(question)
     detected_lvl = level if (level and 1 <= level <= 4) else detect_question_level(norm_q)
 
-    # Encode image to Base64 for API transmission
-    with open(image_path, "rb") as f:
-        img_b64 = base64.b64encode(f.read()).decode("utf-8")
+    def read_rgb(path: str) -> Image.Image:
+        with Image.open(path) as source:
+            return source.convert("RGB")
+
+    def encode_jpeg(image: Image.Image) -> str:
+        output = BytesIO()
+        image.save(output, format="JPEG", quality=92, optimize=True)
+        return base64.b64encode(output.getvalue()).decode("ascii")
+
+    originals = {"A": read_rgb(image_path)}
+    if second_image_path:
+        originals["B"] = read_rgb(second_image_path)
+
+    model_images: list[dict[str, str]] = []
+    marked_images = {slot: img.copy() for slot, img in originals.items()}
+    valid_regions: list[tuple[int, str, tuple[int, int, int, int]]] = []
+    for index, region in enumerate(regions or [], start=1):
+        slot = "B" if region.get("image") == "B" and "B" in originals else "A"
+        image = originals[slot]
+        box = region.get("box") or {}
+        try:
+            x1 = max(0.0, min(1.0, float(box.get("x1", region.get("cx", 0)))))
+            y1 = max(0.0, min(1.0, float(box.get("y1", region.get("cy", 0)))))
+            x2 = max(0.0, min(1.0, float(box.get("x2", region.get("cx", 0)))))
+            y2 = max(0.0, min(1.0, float(box.get("y2", region.get("cy", 0)))))
+        except (TypeError, ValueError):
+            continue
+        if x2 < x1:
+            x1, x2 = x2, x1
+        if y2 < y1:
+            y1, y2 = y2, y1
+        w, h = image.size
+        left, top = round(x1 * w), round(y1 * h)
+        right, bottom = round(x2 * w), round(y2 * h)
+        # A click pin can have no meaningful box; create a small crop around its center.
+        min_w, min_h = max(48, w // 12), max(48, h // 12)
+        if right - left < min_w:
+            center = round(float(region.get("cx", (x1 + x2) / 2)) * w)
+            left, right = max(0, center - min_w // 2), min(w, center + min_w // 2)
+        if bottom - top < min_h:
+            center = round(float(region.get("cy", (y1 + y2) / 2)) * h)
+            top, bottom = max(0, center - min_h // 2), min(h, center + min_h // 2)
+        right, bottom = max(left + 1, right), max(top + 1, bottom)
+        n = int(region.get("n", index)) if str(region.get("n", index)).isdigit() else index
+        label = f"{slot}{n}"
+        valid_regions.append((index, slot, (left, top, min(w, right), min(h, bottom))))
+
+    # Give the model both the full context with visible region labels and close-ups.
+    for slot, image in marked_images.items():
+        draw = ImageDraw.Draw(image)
+        for index, region_slot, (left, top, right, bottom) in valid_regions:
+            if slot != region_slot:
+                continue
+            color = "#ff3b30" if (index % 2) else "#007aff"
+            draw.rectangle((left, top, right, bottom), outline=color, width=max(4, min(image.size) // 180))
+            draw.text((left + 3, max(0, top - 24)), f"{slot}{index}", fill="white", stroke_width=2, stroke_fill=color)
+        model_images.append({"label": f"تصویر {slot} (نمای کامل و نشانه‌گذاری‌شده)", "image_base64": encode_jpeg(image)})
+
+    for index, slot, crop_box in valid_regions:
+        crop = originals[slot].crop(crop_box)
+        crop.thumbnail((512, 512), Image.Resampling.LANCZOS)
+        model_images.append({"label": f"نمای نزدیک ناحیهٔ {slot}{index} از تصویر {slot}", "image_base64": encode_jpeg(crop)})
 
     payload = {
         "question": norm_q,
-        "image_base64": img_b64,
+        "images": model_images,
         "level": detected_lvl,
         "system": SYSTEM_PROMPT
     }
+    if valid_regions:
+        refs = "، ".join(f"{slot}{index}" for index, slot, _ in valid_regions)
+        payload["question"] += f"\nنشانه‌های روی تصاویر و نماهای نزدیک مربوط به ناحیه‌های {refs} هستند؛ پاسخ را با ارجاع دقیق به آن‌ها بده."
 
     start_time = time.perf_counter()
     used_model = AI_MODEL_NAME
@@ -214,17 +280,43 @@ async def query_vqa(
         except Exception as exc:
             logger.warning(f"Error querying remote AI service at {AI_SERVICE_URL}: {exc}")
 
-    # Fallback to local visual analysis engine
-    result = local_visual_analysis(image_path, norm_q, detected_lvl)
+    # Offline fallback is deliberately limited to measurable image properties; it does not
+    # pretend that pixel statistics can identify objects or answer semantic questions.
+    if second_image_path:
+        with Image.open(image_path) as first, Image.open(second_image_path) as second:
+            a = first.convert("RGB")
+            b = second.convert("RGB")
+            aw, ah = a.size
+            bw, bh = b.size
+            ar, ag, ab = ImageStat.Stat(a).mean[:3]
+            br, bg, bb = ImageStat.Stat(b).mean[:3]
+        diff = round((abs(ar - br) + abs(ag - bg) + abs(ab - bb)) / 3, 1)
+        elapsed_ms = (time.perf_counter() - start_time) * 1000
+        return {
+            "question": question,
+            "normalized_question": norm_q,
+            "answer": f"تصویر A ابعاد {aw}×{ah} و میانگین رنگ RGB برابر ({round(ar)}, {round(ag)}, {round(ab)}) دارد؛ تصویر B ابعاد {bw}×{bh} و میانگین RGB برابر ({round(br)}, {round(bg)}, {round(bb)}) دارد. اختلاف میانگین رنگ کانال‌ها {diff} واحد است.",
+            "confidence": "نامطمئن",
+            "evidence": "این پاسخ فقط از اندازه و میانگین RGB محاسبه شده است؛ مدل بینایی راه‌دور در دسترس نبود.",
+            "level": detected_lvl,
+            "model": "Persian-VQA Gateway (Local Image Comparison)",
+            "latency_ms": round(elapsed_ms, 1),
+        }
+
+    # Keep the app usable offline without inventing semantic answers the local analyzer
+    # cannot support. Expose only measurable image metadata until Qwen is connected.
+    with Image.open(image_path) as image:
+        width, height = image.size
+        red, green, blue = ImageStat.Stat(image.convert("RGB")).mean[:3]
     elapsed_ms = (time.perf_counter() - start_time) * 1000
 
     return {
         "question": question,
         "normalized_question": norm_q,
-        "answer": result["answer"],
-        "confidence": result["confidence"],
-        "evidence": result["evidence"],
-        "level": result["level"],
-        "model": "Persian-VQA Gateway (Local Multi-modal Engine / Qwen2-VL Ready)",
+        "answer": f"سرویس مدل بینایی در دسترس نیست؛ فعلاً فقط مشخصات فنی عکس قابل گزارش است: {width}×{height} پیکسل و میانگین RGB برابر ({round(red)}, {round(green)}, {round(blue)}).",
+        "confidence": "نامطمئن",
+        "evidence": "این اطلاعات مستقیماً از ابعاد فایل و میانگین رنگ پیکسل‌ها محاسبه شده؛ پاسخ محتوایی نیازمند اتصال Qwen3-VL است.",
+        "level": detected_lvl,
+        "model": "Offline image statistics (Qwen3-VL service unavailable)",
         "latency_ms": round(elapsed_ms, 1)
     }
