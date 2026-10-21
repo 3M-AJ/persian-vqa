@@ -64,6 +64,23 @@ class AnalyzeResponse(BaseModel):
 class FollowUpRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=4000)
     level: Optional[int] = Field(default=None, ge=1, le=4)
+    pins: List[Dict[str, Any]] = Field(default_factory=list, max_length=8)
+    mode: str = "single"
+
+
+class RegisterRequest(BaseModel):
+    username: str = Field(..., min_length=3, max_length=32, pattern=r"^[A-Za-z0-9_.-]+$")
+    display_name: str = Field(..., min_length=1, max_length=80)
+    password: str = Field(..., min_length=8, max_length=128)
+
+
+class LoginRequest(BaseModel):
+    username: str = Field(..., min_length=1, max_length=32)
+    password: str = Field(..., min_length=1, max_length=128)
+
+
+class RenameRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=120)
 
 
 class RateRequest(BaseModel):
